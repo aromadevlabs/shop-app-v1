@@ -4,6 +4,7 @@ import {
   Camera, ImagePlus, ListChecks, Package, RotateCcw, Sparkles, CircleCheck, Circle, Upload, Info,
   GraduationCap, Zap, Stethoscope, MessageCircle, ShieldAlert,
   Store, FileText, Mic, MicOff, ChevronDown, Shield, Lock,
+  Search, ExternalLink, BookmarkPlus, Database,
 } from "lucide-react";
 
 const SYSTEM_PROMPT_BASE = `You are Throttle Tech, an AI shop assistant for a motorcycle repair business that works on everything from dirt bikes and pit bikes to street bikes and sportbikes (Kawasaki, Honda, and similar makes).
@@ -98,6 +99,35 @@ const ESTIMATE_SYSTEM_ADDON = `\n\nYou are now generating a customer-facing ESTI
 - A bulleted list of likely line items (labor, parts, anything else), each with a rough description. If you don't have exact pricing, say "price TBD" rather than inventing a number — never fabricate a dollar figure.
 - A closing line noting this is a preliminary estimate and final pricing may vary once the bike is inspected.
 Keep it professional, friendly, and ready to hand or read directly to a customer.`;
+
+const PART_FINDER_SYSTEM_ADDON = `\n\nYou are now in PART FINDER mode. The mechanic is trying to identify or source a specific part for a specific bike. Structure your answer as:
+1. Confirm what part you understand they're looking for, for the bike described.
+2. If a specific OEM or common aftermarket part number is well-known and you're genuinely confident in it, give it — but say plainly when you're not fully certain, and always recommend confirming against the parts diagram/VIN before ordering. NEVER state a part number confidently if you're just guessing — say "check the parts fiche for your exact part number" instead of inventing one.
+3. Note common cross-reference/compatibility info if relevant (e.g. "this often fits several years of the same model").
+4. If the mechanic's own parts memory (provided below, if any) has a matching entry, lead with that — it's more reliable than general knowledge since it's this shop's own sourcing history.
+Keep it tight and shop-floor usable, not a wall of text.`;
+
+const PART_RETAILERS = [
+  { name: "RockyMountainATVMC", domain: "rockymountainatvmc.com" },
+  { name: "PartsUnlimited", domain: "parts-unlimited.com" },
+  { name: "Partzilla", domain: "partzilla.com" },
+  { name: "RevZilla", domain: "revzilla.com" },
+  { name: "BikeBandit", domain: "bikebandit.com" },
+];
+
+function buildSmartLinks(bike, part) {
+  const q = `${bike} ${part}`.trim();
+  if (!q) return [];
+  const links = PART_RETAILERS.map((r) => ({
+    label: r.name,
+    url: `https://www.google.com/search?q=${encodeURIComponent(`site:${r.domain} ${q}`)}`,
+  }));
+  links.push({
+    label: "General web search",
+    url: `https://www.google.com/search?q=${encodeURIComponent(`${q} part number`)}`,
+  });
+  return links;
+}
 
 const SHOP_LOCATIONS = [
   { code: "MO", label: "Missouri" },
@@ -255,6 +285,22 @@ export default function ThrottleTech() {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
 
+  // part finder state
+  const [pfBike, setPfBike] = useState("");
+  const [pfQuery, setPfQuery] = useState("");
+  const [pfLoading, setPfLoading] = useState(false);
+  const [pfError, setPfError] = useState(null);
+  const [pfResult, setPfResult] = useState(null);
+  const [pfView, setPfView] = useState("search"); // 'search' | 'memory'
+  const [partsMemory, setPartsMemory] = useState([]);
+  const [pfMemorySearch, setPfMemorySearch] = useState("");
+  const [pfSaveOpen, setPfSaveOpen] = useState(false);
+  const [pfSavePartNumber, setPfSavePartNumber] = useState("");
+  const [pfSaveSource, setPfSaveSource] = useState("");
+  const [pfSavePrice, setPfSavePrice] = useState("");
+  const [pfSaveNotes, setPfSaveNotes] = useState("");
+  const [pfSavedFlag, setPfSavedFlag] = useState(false);
+
   const [activeTab, setActiveTab] = useState("chat"); // 'chat' | 'shop' | 'track'
 
   // shared context
@@ -341,12 +387,13 @@ export default function ThrottleTech() {
     setShopDataLoaded(false);
     (async () => {
       try {
-        const [threadsRes, notesRes, shopHistRes, trackRes, boardRes] = await Promise.all([
+        const [threadsRes, notesRes, shopHistRes, trackRes, boardRes, partsMemRes] = await Promise.all([
           window.storage.get(`${session.shopId}::threads-index`).catch(() => null),
           window.storage.get(`${session.shopId}::shop-notes`).catch(() => null),
           window.storage.get(`${session.shopId}::shop-history`).catch(() => null),
           window.storage.get(`${session.shopId}::track-state`).catch(() => null),
           window.storage.get(`${session.shopId}::shop-board`, true).catch(() => null),
+          window.storage.get(`${session.shopId}::parts-memory`, true).catch(() => null),
         ]);
         const threadIndex = threadsRes ? JSON.parse(threadsRes.value) : [];
         const loadedThreads = {};
@@ -376,6 +423,7 @@ export default function ThrottleTech() {
           setShopStatusState("open");
           setJobs([]);
         }
+        setPartsMemory(partsMemRes ? JSON.parse(partsMemRes.value) : []);
       } catch (e) {
         console.error("Shop data load error", e);
       } finally {
@@ -421,6 +469,11 @@ export default function ThrottleTech() {
   async function persistBoard(status, jobList) {
     if (!session) return;
     try { await window.storage.set(`${session.shopId}::shop-board`, JSON.stringify({ status, jobs: jobList }), true); } catch (e) {}
+  }
+
+  async function persistPartsMemory(list) {
+    if (!session) return;
+    try { await window.storage.set(`${session.shopId}::parts-memory`, JSON.stringify(list), true); } catch (e) {}
   }
 
   function startNewThread() {
@@ -548,6 +601,10 @@ export default function ThrottleTech() {
     setAdminUnlocked(false);
     setAdminCodeInput("");
     setAdminError(null);
+    setPartsMemory([]);
+    setPfResult(null);
+    setPfBike("");
+    setPfQuery("");
   }
 
   // ---------- Admin panel ----------
@@ -599,6 +656,86 @@ export default function ThrottleTech() {
     } finally {
       setDeletingId(null);
     }
+  }
+
+  // ---------- Part Finder ----------
+  function matchingMemory(bike, part) {
+    const q = `${bike} ${part}`.toLowerCase();
+    const bikeWords = bike.toLowerCase().split(/\s+/).filter(Boolean);
+    return partsMemory.filter((m) => {
+      const hay = `${m.bike} ${m.partName} ${m.partNumber || ""}`.toLowerCase();
+      const bikeMatch = bikeWords.length === 0 || bikeWords.some((w) => w.length > 1 && hay.includes(w));
+      const partMatch = !part.trim() || hay.includes(part.toLowerCase().split(/\s+/)[0] || "");
+      return bikeMatch && partMatch;
+    });
+  }
+
+  async function askPartFinder() {
+    if (!pfQuery.trim() || pfLoading) return;
+    setPfLoading(true);
+    setPfError(null);
+    setPfResult(null);
+    setPfSaveOpen(false);
+    setPfSavedFlag(false);
+
+    try {
+      const memHits = matchingMemory(pfBike, pfQuery).slice(0, 5);
+      const memNote = memHits.length
+        ? `\n\nThis shop's own parts memory has these possibly-relevant past entries:\n${memHits
+            .map((m) => `- ${m.bike}: ${m.partName}${m.partNumber ? ` (#${m.partNumber})` : ""}${m.source ? `, sourced from ${m.source}` : ""}${m.price ? ` for $${m.price}` : ""}`)
+            .join("\n")}`
+        : "";
+
+      const prompt = `Bike: ${pfBike || "not specified"}\nLooking for: ${pfQuery.trim()}`;
+      const response = await fetch("/api/claude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 900,
+          system: SYSTEM_PROMPT_BASE + PART_FINDER_SYSTEM_ADDON + memNote,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      if (!response.ok) throw new Error("Request failed: " + response.status);
+      const data = await response.json();
+      const textBlocks = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+      setPfResult(textBlocks || "No response.");
+    } catch (err) {
+      setPfError("Stripped a bolt on that request — try again.");
+    } finally {
+      setPfLoading(false);
+    }
+  }
+
+  async function savePartToMemory() {
+    if (!pfQuery.trim()) return;
+    const record = {
+      id: uid(),
+      bike: pfBike.trim(),
+      partName: pfQuery.trim(),
+      partNumber: pfSavePartNumber.trim(),
+      source: pfSaveSource.trim(),
+      price: pfSavePrice.trim(),
+      notes: pfSaveNotes.trim(),
+      savedAt: Date.now(),
+    };
+    const updated = [record, ...partsMemory];
+    setPartsMemory(updated);
+    persistPartsMemory(updated);
+    setPfSaveOpen(false);
+    setPfSavePartNumber("");
+    setPfSaveSource("");
+    setPfSavePrice("");
+    setPfSaveNotes("");
+    setPfSavedFlag(true);
+    setTimeout(() => setPfSavedFlag(false), 1800);
+  }
+
+  function deleteMemoryItem(id) {
+    const updated = partsMemory.filter((m) => m.id !== id);
+    setPartsMemory(updated);
+    persistPartsMemory(updated);
   }
 
   function contextLabel() {
@@ -965,6 +1102,7 @@ export default function ThrottleTech() {
     { id: "board", label: "Shop Board", icon: Store },
     { id: "chat", label: "Chat Assistant", icon: MessageSquare },
     { id: "shop", label: "Shop Assistant", icon: Camera },
+    { id: "parts", label: "Part Finder", icon: Search },
     { id: "track", label: "Track Assistant", icon: ListChecks },
     { id: "info", label: "Info", icon: Info },
     { id: "admin", label: "Admin", icon: Shield },
@@ -1653,6 +1791,179 @@ export default function ThrottleTech() {
           </>
         )}
 
+        {/* ===================== PART FINDER ===================== */}
+        {activeTab === "parts" && (
+          <div className="tt-bg-texture relative flex-1 overflow-y-auto px-4 py-5 flex flex-col gap-5">
+            <Search className="tt-watermark" strokeWidth={0.5} color="var(--offwhite)" />
+
+            {/* sub-nav */}
+            <div className="flex gap-1 text-xs">
+              <button
+                onClick={() => setPfView("search")}
+                className="tt-btn flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded"
+                style={{ backgroundColor: pfView === "search" ? "var(--panel)" : "transparent", color: pfView === "search" ? "var(--offwhite)" : "var(--steel)", border: "1px solid var(--panel-border)" }}
+              >
+                <Search size={13} /> Find a Part
+              </button>
+              <button
+                onClick={() => setPfView("memory")}
+                className="tt-btn flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded"
+                style={{ backgroundColor: pfView === "memory" ? "var(--panel)" : "transparent", color: pfView === "memory" ? "var(--offwhite)" : "var(--steel)", border: "1px solid var(--panel-border)" }}
+              >
+                <Database size={13} /> Parts Memory ({partsMemory.length})
+              </button>
+            </div>
+
+            {pfView === "search" ? (
+              <>
+                <p className="text-sm" style={{ color: "var(--steel)" }}>
+                  Tell it the bike and the part — it checks your shop's own sourcing history first, then asks the AI, then gives you one-click search links to real parts retailers.
+                </p>
+
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    value={pfBike}
+                    onChange={(e) => setPfBike(e.target.value)}
+                    placeholder="Bike — e.g. 2019 Honda CBR650R"
+                    className="flex-1 rounded px-3 py-2.5 text-sm outline-none"
+                    style={{ backgroundColor: "var(--panel)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }}
+                  />
+                  <input
+                    value={pfQuery}
+                    onChange={(e) => setPfQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && askPartFinder()}
+                    placeholder="Part — e.g. front brake pads"
+                    className="flex-1 rounded px-3 py-2.5 text-sm outline-none"
+                    style={{ backgroundColor: "var(--panel)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }}
+                  />
+                  <button
+                    onClick={askPartFinder}
+                    disabled={pfLoading || !pfQuery.trim()}
+                    className="tt-btn flex items-center gap-2 text-sm px-4 py-2.5 rounded font-medium disabled:opacity-40 shrink-0"
+                    style={{ backgroundColor: "var(--mw-red)", color: "#161616" }}
+                  >
+                    <Sparkles size={15} /> Ask
+                  </button>
+                </div>
+
+                {/* live memory matches */}
+                {(pfBike.trim() || pfQuery.trim()) && matchingMemory(pfBike, pfQuery).length > 0 && (
+                  <div className="rounded-md px-4 py-3" style={{ backgroundColor: "rgba(160,105,47,0.12)", border: "1px solid var(--caution)" }}>
+                    <p className="text-[10px] tracking-widest mb-2" style={{ color: "var(--caution)" }}>WE'VE SOURCED THIS BEFORE</p>
+                    <div className="flex flex-col gap-2">
+                      {matchingMemory(pfBike, pfQuery).slice(0, 4).map((m) => (
+                        <div key={m.id} className="text-xs" style={{ color: "var(--offwhite)" }}>
+                          <span className="font-medium">{m.bike}</span> — {m.partName}
+                          {m.partNumber && <span style={{ color: "var(--steel)" }}> · #{m.partNumber}</span>}
+                          {m.source && <span style={{ color: "var(--steel)" }}> · {m.source}</span>}
+                          {m.price && <span style={{ color: "var(--steel)" }}> · ${m.price}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {pfLoading && (
+                  <div className="rounded-md px-4 py-3 text-sm flex items-center gap-3 tt-msg" style={{ backgroundColor: "var(--panel)", border: "1px solid var(--panel-border)" }}>
+                    <svg viewBox="0 0 24 24" className="w-6 h-6" style={{ animation: "tt-gauge-spin 1.4s linear infinite" }}>
+                      <circle cx="12" cy="12" r="9" fill="none" stroke="#3a3a3a" strokeWidth="2" />
+                      <circle cx="12" cy="12" r="9" fill="none" stroke="var(--caution)" strokeWidth="2" strokeLinecap="round" strokeDasharray="14 42" />
+                    </svg>
+                    <span style={{ color: "var(--steel)" }}>Looking it up...</span>
+                  </div>
+                )}
+                {pfError && <div className="text-sm px-3 py-2 rounded border" style={{ borderColor: "var(--mw-red)", color: "var(--mw-red)" }}>{pfError}</div>}
+
+                {pfResult && (
+                  <div className="rounded-md px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap tt-msg" style={{ backgroundColor: "var(--panel)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }}>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[10px] tracking-widest" style={{ color: "var(--caution)" }}>THROTTLE TECH</span>
+                      <button onClick={() => setPfSaveOpen((s) => !s)} className="flex items-center gap-1 text-[11px] opacity-80 hover:opacity-100">
+                        {pfSavedFlag ? <Check size={13} /> : <BookmarkPlus size={13} />} Save to Parts Memory
+                      </button>
+                    </div>
+                    {pfResult}
+
+                    {pfSaveOpen && (
+                      <div className="mt-3 pt-3 flex flex-col gap-2" style={{ borderTop: "1px solid var(--panel-border)" }}>
+                        <div className="flex flex-col sm:flex-row gap-2">
+                          <input value={pfSavePartNumber} onChange={(e) => setPfSavePartNumber(e.target.value)} placeholder="Part # (optional)" className="flex-1 rounded px-3 py-2 text-xs outline-none" style={{ backgroundColor: "var(--panel-2)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }} />
+                          <input value={pfSaveSource} onChange={(e) => setPfSaveSource(e.target.value)} placeholder="Where you got it (optional)" className="flex-1 rounded px-3 py-2 text-xs outline-none" style={{ backgroundColor: "var(--panel-2)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }} />
+                          <input value={pfSavePrice} onChange={(e) => setPfSavePrice(e.target.value)} placeholder="Price (optional)" className="w-full sm:w-24 rounded px-3 py-2 text-xs outline-none" style={{ backgroundColor: "var(--panel-2)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }} />
+                        </div>
+                        <input value={pfSaveNotes} onChange={(e) => setPfSaveNotes(e.target.value)} placeholder="Notes (optional)" className="w-full rounded px-3 py-2 text-xs outline-none" style={{ backgroundColor: "var(--panel-2)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }} />
+                        <button onClick={savePartToMemory} className="tt-btn self-start flex items-center gap-1.5 text-xs px-3 py-1.5 rounded font-medium" style={{ backgroundColor: "var(--caution)", color: "#161616" }}>
+                          <BookmarkPlus size={13} /> Save this part
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {(pfBike.trim() || pfQuery.trim()) && (
+                  <div>
+                    <p className="text-[10px] tracking-widest mb-2" style={{ color: "var(--steel)" }}>SEARCH REAL RETAILERS</p>
+                    <div className="flex flex-wrap gap-2">
+                      {buildSmartLinks(pfBike, pfQuery).map((link) => (
+                        <a
+                          key={link.label}
+                          href={link.url}
+                          target="_blank"
+                          rel="noopener"
+                          className="tt-btn flex items-center gap-1.5 text-xs px-3 py-2 rounded border"
+                          style={{ borderColor: "var(--panel-border)", color: "var(--offwhite)", backgroundColor: "var(--panel)" }}
+                        >
+                          {link.label} <ExternalLink size={12} />
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <input
+                  value={pfMemorySearch}
+                  onChange={(e) => setPfMemorySearch(e.target.value)}
+                  placeholder="Search saved parts..."
+                  className="w-full rounded px-3 py-2.5 text-sm outline-none"
+                  style={{ backgroundColor: "var(--panel)", border: "1px solid var(--panel-border)", color: "var(--offwhite)" }}
+                />
+                <div className="flex flex-col gap-2">
+                  {partsMemory.length === 0 ? (
+                    <p className="text-sm" style={{ color: "var(--steel)" }}>
+                      Nothing saved yet. Every part you save from a lookup shows up here — shared across the whole shop.
+                    </p>
+                  ) : (
+                    partsMemory
+                      .filter((m) => {
+                        const q = pfMemorySearch.toLowerCase();
+                        if (!q) return true;
+                        return `${m.bike} ${m.partName} ${m.partNumber || ""} ${m.source || ""}`.toLowerCase().includes(q);
+                      })
+                      .map((m) => (
+                        <div key={m.id} className="rounded-md px-4 py-3 flex items-start justify-between gap-3 tt-msg" style={{ backgroundColor: "var(--panel)", border: "1px solid var(--panel-border)" }}>
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium" style={{ color: "var(--offwhite)" }}>{m.partName}</p>
+                            <p className="text-xs mt-0.5" style={{ color: "var(--caution)" }}>{m.bike || "Bike not specified"}</p>
+                            <p className="text-xs mt-1" style={{ color: "var(--steel)" }}>
+                              {m.partNumber && <span>#{m.partNumber}  </span>}
+                              {m.source && <span>· {m.source}  </span>}
+                              {m.price && <span>· ${m.price}</span>}
+                            </p>
+                            {m.notes && <p className="text-xs mt-1 italic" style={{ color: "var(--steel)" }}>{m.notes}</p>}
+                            <p className="text-[10px] mt-1" style={{ color: "var(--steel)" }}>{new Date(m.savedAt).toLocaleDateString()}</p>
+                          </div>
+                          <Trash2 size={14} className="shrink-0 opacity-50 hover:opacity-100 cursor-pointer" onClick={() => deleteMemoryItem(m.id)} />
+                        </div>
+                      ))
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         {/* ===================== TRACK ASSISTANT ===================== */}
         {activeTab === "track" && (
           <div className="tt-bg-texture relative flex-1 overflow-y-auto px-4 py-5 flex flex-col gap-5">
@@ -1826,6 +2137,20 @@ export default function ThrottleTech() {
                       describe what you want done (fix, upgrade, change), and it gives you: what it sees in the
                       photo, the tools you'll need, step-by-step how to do it, parts you may need to order, and any
                       safety warnings for that specific job.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-md p-4 flex gap-3" style={{ backgroundColor: "var(--panel)", border: "1px solid var(--panel-border)" }}>
+                  <Search size={20} className="shrink-0 mt-0.5" style={{ color: "var(--mw-red)" }} />
+                  <div>
+                    <p className="text-sm font-medium mb-1" style={{ color: "var(--offwhite)" }}>Part Finder</p>
+                    <p className="text-sm leading-relaxed" style={{ color: "var(--steel)" }}>
+                      Type a bike and a part, hit Ask. It checks your shop's own Parts Memory first (your own past
+                      sourcing — more reliable than anything generic), then gives you an AI answer, then one-click
+                      search links straight to real parts retailers (RockyMountainATVMC, PartsUnlimited, Partzilla,
+                      RevZilla, BikeBandit). Save any part you look up to Parts Memory so next time the same bike
+                      comes in, the answer is already sitting there. Parts Memory is shared across the whole shop.
                     </p>
                   </div>
                 </div>
